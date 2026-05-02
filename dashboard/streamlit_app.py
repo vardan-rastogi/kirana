@@ -37,6 +37,14 @@ import os
 import time
 from typing import Dict, List, Optional, Tuple
 
+import sys
+
+# Tell Python to look at the root directory of the project
+current_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.abspath(os.path.join(current_dir, '..'))
+if root_dir not in sys.path:
+    sys.path.append(root_dir)
+
 import matplotlib
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
@@ -432,8 +440,8 @@ def render_peer_chart(peer: dict, income_percentile: int) -> plt.Figure:
     ax.axis("off")
 
     # Background gradient band
-    ax.barh(0.5, 100, 0.5, left=0,  color="#1a2130", height=0.5)
-    ax.barh(0.5, 50,  0.5, left=25, color="#1e2a3a", height=0.5)
+    ax.barh(0.5, 100, 0.5, left=0,  color="#1a2130")
+    ax.barh(0.5, 50,  0.5, left=25, color="#1e2a3a")
 
     # P25 and P75 markers
     for pct, label, col in [
@@ -557,13 +565,13 @@ def render_fraud_gauge(fraud_score: float) -> plt.Figure:
     ax.axis("off")
 
     # Track
-    ax.barh(0.5, 1.0, 0.38, left=0, color="#1a2130", height=0.38)
+    ax.barh(0.5, 1.0, 0.38, left=0, color="#1a2130")
     # Green zone
-    ax.barh(0.5, 0.20, 0.38, left=0,    color="#22c55e", alpha=0.35, height=0.38)
+    ax.barh(0.5, 0.20, 0.38, left=0, color="#22c55e", alpha=0.35)
     # Amber zone
-    ax.barh(0.5, 0.30, 0.38, left=0.20, color="#f59e0b", alpha=0.35, height=0.38)
+    ax.barh(0.5, 0.30, 0.38, left=0.20, color="#f59e0b", alpha=0.35)
     # Red zone
-    ax.barh(0.5, 0.50, 0.38, left=0.50, color="#ef4444", alpha=0.35, height=0.38)
+    ax.barh(0.5, 0.50, 0.38, left=0.50, color="#ef4444", alpha=0.35)
 
     # Score fill
     fill_col = (
@@ -571,7 +579,7 @@ def render_fraud_gauge(fraud_score: float) -> plt.Figure:
         "#f59e0b" if fraud_score < 0.50 else
         "#ef4444"
     )
-    ax.barh(0.5, fraud_score, 0.38, left=0, color=fill_col, alpha=0.90, height=0.38)
+    ax.barh(0.5, fraud_score, 0.38, left=0, color=fill_col, alpha=0.90)
 
     # Needle
     ax.axvline(fraud_score, color="#ffffff", linewidth=2, alpha=0.9)
