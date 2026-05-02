@@ -2,36 +2,35 @@
 # api/router.py
 # =============================================================================
 """
-Assessment API router.
+FastAPI assessment router.
 
-Defines POST /v1/assess — the single endpoint that accepts images and
-metadata, runs the full pipeline via the orchestrator, and returns a
-complete AssessmentResponse.
+Defines the single POST /v1/assess endpoint. Responsibilities:
+  - Accept multipart/form-data (images + optional video + form fields).
+  - Validate image count and GPS bounds (fast, before any pipeline work).
+  - Enforce per-image size cap (prevents Railway free-tier timeouts on
+    uncompressed iPhone photos; Streamlit compresses before upload).
+  - Parse the JSON-encoded hmac_commitments string from form data.
+  - Accept sdk_simulate_rooted and sdk_simulate_mock_gps booleans from
+    the Streamlit Edge SDK Hardware Simulator panel.
+  - Delegate entirely to orchestrator.run_assessment().
+  - Return the complete AssessmentResponse or a structured HTTP error.
 
-Image handling:
-    Images arrive as multipart/form-data UploadFile objects.
-    Each image is read into bytes here; the router owns no business logic.
-    All pipeline logic lives in services/orchestrator.py.
-
-Validation:
-    Image count (3–5), GPS bounds, and HMAC commitments are validated here
-    before the orchestrator is invoked. This keeps error messages fast and
-    prevents unnecessary pipeline invocations on malformed requests.
+This file contains zero business logic. If you find yourself adding an
+if-statement about fraud here, move it to the fraud checker instead.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
-import logging
 from typing import List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
-from fastapi.responses import JSONResponse
 
 import config
-from api.schemas import AssessmentRequest, AssessmentResponse
+from api.schemas import AssessmentRequest, AssessmentResponse, HealthResponse
 from services.orchestrator import run_assessment
 
 logger = logging.getLogger("kiranaiq.router")
@@ -39,68 +38,170 @@ logger = logging.getLogger("kiranaiq.router")
 router = APIRouter()
 
 
+# ---------------------------------------------------------------------------
+# Assessment endpoint
+# ---------------------------------------------------------------------------
+
 @router.post(
     "/assess",
     response_model=AssessmentResponse,
-    summary="Run a KiranaIQ cash flow assessment",
+    summary="Run a KiranaIQ remote cash flow assessment",
     description=(
-        "Accepts 3–5 store images and optional metadata. "
+        "Accepts 3–5 store images (JPEG/PNG), an optional 10-second video "
+        "(.mp4), GPS coordinates, and optional store metadata. "
         "Returns a complete cash flow assessment with income ranges, "
-        "credit limit recommendation, fraud scores, and SHAP-equivalent "
-        "explainability. Assessment ID is unique per call."
+        "credit limit, fraud scores, step-EMI schedule, and RBI-compliant "
+        "SHAP-equivalent explainability output."
     ),
     status_code=status.HTTP_200_OK,
+    responses={
+        422: {"description": "Validation error — image count, GPS bounds, or size."},
+        500: {"description": "Internal pipeline failure."},
+    },
 )
 async def create_assessment(
-    # ── Images (mandatory)
+    # ── Images (mandatory, 3–5) ────────────────────────────────────────────
     images: List[UploadFile] = File(
         ...,
-        description="3–5 store photos (interior, counter, exterior). JPEG/PNG.",
+        description=(
+            "3–5 store photographs. Required views: interior shelves, "
+            "counter area, exterior/storefront. JPEG or PNG. "
+            "Streamlit compresses to ≤500 KB each before upload."
+        ),
     ),
-    # ── Optional video
+
+    # ── Optional video ─────────────────────────────────────────────────────
     video: Optional[UploadFile] = File(
         default=None,
-        description="Optional 10-second video (.mp4). Processed for temporal fraud.",
+        description=(
+            "Optional 10-second store walkthrough video (.mp4). "
+            "Processed for T-1/T-2/T-3 temporal fraud detection. "
+            "On-device frame decimation happens before upload in production; "
+            "full video accepted here for demo purposes."
+        ),
     ),
-    # ── Form fields (sent alongside files in multipart)
-    gps_lat: float = Form(...),
-    gps_lon: float = Form(...),
-    capture_timestamp: Optional[int] = Form(default=None),
+
+    # ── GPS coordinates (mandatory) ────────────────────────────────────────
+    gps_lat: float = Form(
+        ...,
+        description="Decimal degrees latitude. India bounds: 6.0–37.5°N.",
+    ),
+    gps_lon: float = Form(
+        ...,
+        description="Decimal degrees longitude. India bounds: 68.0–97.5°E.",
+    ),
+
+    # ── Capture metadata ───────────────────────────────────────────────────
+    capture_timestamp: Optional[int] = Form(
+        default=None,
+        description=(
+            "Unix epoch timestamp of image capture. "
+            "If omitted, server time is used (demo-safe)."
+        ),
+    ),
     hmac_commitments: str = Form(
         default="[]",
-        description="JSON-encoded list of HMAC commitment strings.",
+        description=(
+            "JSON-encoded array of HMAC-SHA256 commitment strings, one per image. "
+            "Generated by the Android SDK at capture time. "
+            "Pass '[]' in demo mode — the server generates demo commitments."
+        ),
     ),
-    shop_size_sqft: Optional[int] = Form(default=None),
-    monthly_rent_inr: Optional[int] = Form(default=None),
-    property_owned: bool = Form(default=False),
-    years_in_operation: Optional[int] = Form(default=None),
-    sdk_attested: bool = Form(default=False),
+
+    # ── Optional store metadata ────────────────────────────────────────────
+    shop_size_sqft: Optional[int] = Form(
+        default=None,
+        description="Self-reported floor area in square feet.",
+    ),
+    monthly_rent_inr: Optional[int] = Form(
+        default=None,
+        description=(
+            "Monthly rent in ₹. Pass 0 only when property_owned=True. "
+            "If omitted, a geo-derived prior is used."
+        ),
+    ),
+    property_owned: bool = Form(
+        default=False,
+        description=(
+            "True if merchant owns the commercial property. "
+            "Bypasses rent fraud checks and applies the 1.08× "
+            "ownership confidence premium."
+        ),
+    ),
+    years_in_operation: Optional[int] = Form(
+        default=None,
+        description=(
+            "Self-reported years of operation. "
+            "Used for the Lindy Effect vintage confidence multiplier."
+        ),
+    ),
+    sdk_attested: bool = Form(
+        default=False,
+        description=(
+            "True if the Android SDK passed Play Integrity attestation. "
+            "In demo mode this flag is informational only."
+        ),
+    ),
+
+    # ── Edge SDK Hardware Simulator (Streamlit UI only) ────────────────────
+    sdk_simulate_rooted: bool = Form(
+        default=False,
+        description=(
+            "Streamlit Edge SDK Simulator: simulate a rooted device. "
+            "If True, the assessment is hard-blocked and fraud_score=1.0. "
+            "Demonstrates Android Play Integrity check behaviour."
+        ),
+    ),
+    sdk_simulate_mock_gps: bool = Form(
+        default=False,
+        description=(
+            "Streamlit Edge SDK Simulator: simulate a mock GPS app. "
+            "If True, the assessment is hard-blocked and fraud_score=1.0. "
+            "Demonstrates Location.isFromMockProvider() check behaviour."
+        ),
+    ),
 ) -> AssessmentResponse:
     """
-    Main assessment endpoint.
+    Main assessment endpoint — I/O + validation only.
 
-    Validates inputs, reads image bytes, builds the AssessmentRequest,
-    and delegates to the orchestrator. All pipeline logic is in the
-    orchestrator; this function is purely I/O and validation.
+    All business logic is in the orchestrator. This function:
+      1. Generates a unique assessment ID.
+      2. Validates image count and file sizes.
+      3. Parses the HMAC commitments JSON string.
+      4. Reads image and video bytes from UploadFile objects.
+      5. Builds the typed AssessmentRequest.
+      6. Calls orchestrator.run_assessment() and returns the result.
     """
-    request_id = f"KIQ-{uuid.uuid4().hex[:12].upper()}"
+    assessment_id = f"KIQ-{uuid.uuid4().hex[:12].upper()}"
+    request_start = time.time()
+
     logger.info(
-        "Assessment %s initiated | GPS: %.4f,%.4f | Images: %d | Mode: %s",
-        request_id, gps_lat, gps_lon, len(images), config.MODE,
+        "Request received | %s | images=%d | video=%s | lat=%.4f | lon=%.4f "
+        "| rooted_sim=%s | mock_gps_sim=%s | mode=%s",
+        assessment_id,
+        len(images),
+        video is not None,
+        gps_lat,
+        gps_lon,
+        sdk_simulate_rooted,
+        sdk_simulate_mock_gps,
+        config.MODE,
     )
 
-    # ── Image count validation
+    # ── Validation 1: Image count ──────────────────────────────────────────
     if len(images) < 3:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
                 "error": "insufficient_images",
+                "assessment_id": assessment_id,
+                "received": len(images),
+                "minimum": 3,
                 "message": (
                     f"Received {len(images)} image(s). "
-                    "A minimum of 3 images is required: "
-                    "interior shelves, counter area, and exterior storefront."
+                    "A minimum of 3 is required: interior shelves, "
+                    "counter area, and exterior storefront."
                 ),
-                "assessment_id": request_id,
             },
         )
     if len(images) > 5:
@@ -108,117 +209,157 @@ async def create_assessment(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
                 "error": "too_many_images",
-                "message": f"Received {len(images)} images. Maximum is 5.",
-                "assessment_id": request_id,
+                "assessment_id": assessment_id,
+                "received": len(images),
+                "maximum": 5,
+                "message": f"Received {len(images)} images. Maximum allowed is 5.",
             },
         )
 
-    # ── GPS bounds validation (India)
+    # ── Validation 2: GPS India bounds ────────────────────────────────────
     if not (config.GPS_INDIA_LAT_MIN <= gps_lat <= config.GPS_INDIA_LAT_MAX):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
-                "error": "gps_out_of_bounds",
+                "error": "gps_latitude_out_of_bounds",
+                "assessment_id": assessment_id,
+                "received": gps_lat,
+                "valid_range": [config.GPS_INDIA_LAT_MIN, config.GPS_INDIA_LAT_MAX],
                 "message": (
-                    f"Latitude {gps_lat} is outside India bounds "
-                    f"({config.GPS_INDIA_LAT_MIN}–{config.GPS_INDIA_LAT_MAX})."
+                    f"Latitude {gps_lat:.4f} is outside India bounds. "
+                    f"Valid range: {config.GPS_INDIA_LAT_MIN}–{config.GPS_INDIA_LAT_MAX}°N."
                 ),
-                "assessment_id": request_id,
             },
         )
     if not (config.GPS_INDIA_LON_MIN <= gps_lon <= config.GPS_INDIA_LON_MAX):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
-                "error": "gps_out_of_bounds",
+                "error": "gps_longitude_out_of_bounds",
+                "assessment_id": assessment_id,
+                "received": gps_lon,
+                "valid_range": [config.GPS_INDIA_LON_MIN, config.GPS_INDIA_LON_MAX],
                 "message": (
-                    f"Longitude {gps_lon} is outside India bounds "
-                    f"({config.GPS_INDIA_LON_MIN}–{config.GPS_INDIA_LON_MAX})."
+                    f"Longitude {gps_lon:.4f} is outside India bounds. "
+                    f"Valid range: {config.GPS_INDIA_LON_MIN}–{config.GPS_INDIA_LON_MAX}°E."
                 ),
-                "assessment_id": request_id,
             },
         )
 
-    # ── Parse HMAC commitments (JSON string from form data)
+    # ── Parse HMAC commitments ────────────────────────────────────────────
     try:
         parsed_commitments: List[str] = json.loads(hmac_commitments)
         if not isinstance(parsed_commitments, list):
-            raise ValueError("commitments must be a JSON array")
-    except (json.JSONDecodeError, ValueError):
+            raise ValueError("Expected a JSON array.")
+        if not all(isinstance(c, str) for c in parsed_commitments):
+            raise ValueError("All commitment entries must be strings.")
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning(
+            "%s | Could not parse hmac_commitments: %s — defaulting to []",
+            assessment_id, exc,
+        )
         parsed_commitments = []
-        logger.warning("Assessment %s: Could not parse HMAC commitments.", request_id)
 
-    # ── Read image bytes (enforce per-image size cap)
+    # ── Read image bytes + per-image size cap ─────────────────────────────
     image_bytes_list: List[bytes] = []
     for idx, upload in enumerate(images):
         raw = await upload.read()
         if len(raw) > config.MAX_IMAGE_SIZE_BYTES:
+            size_mb = len(raw) / 1_048_576
+            cap_mb  = config.MAX_IMAGE_SIZE_BYTES / 1_048_576
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                 detail={
                     "error": "image_too_large",
+                    "assessment_id": assessment_id,
+                    "image_index": idx + 1,
+                    "filename": upload.filename,
+                    "size_mb": round(size_mb, 2),
+                    "limit_mb": cap_mb,
                     "message": (
-                        f"Image {idx + 1} ({upload.filename}) is "
-                        f"{len(raw) / 1024 / 1024:.1f} MB. "
-                        f"Maximum is {config.MAX_IMAGE_SIZE_BYTES // 1024 // 1024} MB. "
-                        "Please compress images in the Streamlit UI before uploading."
+                        f"Image {idx + 1} ({upload.filename}) is {size_mb:.1f} MB. "
+                        f"Maximum is {cap_mb:.0f} MB. "
+                        "Please enable image compression in the Streamlit sidebar "
+                        "(PIL thumbnail 1024×1024, quality 85)."
                     ),
-                    "assessment_id": request_id,
                 },
             )
         image_bytes_list.append(raw)
+        logger.debug(
+            "%s | Image %d read: %s (%.1f KB)",
+            assessment_id, idx + 1,
+            upload.filename,
+            len(raw) / 1024,
+        )
 
-    # ── Read optional video bytes
+    # ── Read optional video bytes ─────────────────────────────────────────
     video_bytes: Optional[bytes] = None
     if video is not None:
         video_bytes = await video.read()
         logger.info(
-            "Assessment %s: Video received (%.1f MB).",
-            request_id,
-            len(video_bytes) / 1024 / 1024,
+            "%s | Video received: %s (%.2f MB)",
+            assessment_id,
+            video.filename,
+            len(video_bytes) / 1_048_576,
         )
 
-    # ── Build typed request object
+    # ── Build typed request object ────────────────────────────────────────
     ts = capture_timestamp if capture_timestamp is not None else int(time.time())
-    request = AssessmentRequest(
-        gps_lat=gps_lat,
-        gps_lon=gps_lon,
-        capture_timestamp=ts,
-        hmac_commitments=parsed_commitments,
-        shop_size_sqft=shop_size_sqft,
-        monthly_rent_inr=monthly_rent_inr,
-        property_owned=property_owned,
-        years_in_operation=years_in_operation,
-        sdk_attested=sdk_attested,
-    )
 
-    # ── Delegate to orchestrator
+    try:
+        request = AssessmentRequest(
+            gps_lat=gps_lat,
+            gps_lon=gps_lon,
+            capture_timestamp=ts,
+            hmac_commitments=parsed_commitments,
+            shop_size_sqft=shop_size_sqft,
+            monthly_rent_inr=monthly_rent_inr,
+            property_owned=property_owned,
+            years_in_operation=years_in_operation,
+            sdk_attested=sdk_attested,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "request_validation_failed",
+                "assessment_id": assessment_id,
+                "message": str(exc),
+            },
+        ) from exc
+
+    # ── Delegate to orchestrator ──────────────────────────────────────────
     try:
         result: AssessmentResponse = await run_assessment(
-            assessment_id=request_id,
+            assessment_id=assessment_id,
             request=request,
             image_bytes_list=image_bytes_list,
             video_bytes=video_bytes,
+            is_rooted=sdk_simulate_rooted,
+            is_mock_location=sdk_simulate_mock_gps,
         )
     except Exception as exc:
+        elapsed_ms = int((time.time() - request_start) * 1000)
         logger.exception(
-            "Assessment %s failed in orchestrator: %s", request_id, exc
+            "%s | Orchestrator failure after %dms: %s",
+            assessment_id, elapsed_ms, exc,
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
                 "error": "assessment_pipeline_failure",
+                "assessment_id": assessment_id,
                 "message": (
                     "The assessment pipeline encountered an unexpected error. "
-                    "This has been logged. Please retry."
+                    "This has been logged automatically. "
+                    "Please retry — if the error persists, check /health."
                 ),
-                "assessment_id": request_id,
             },
         ) from exc
 
     logger.info(
-        "Assessment %s complete | %dms | Confidence: %.2f | Rec: %s",
-        request_id,
+        "%s | Response sent | %dms | conf=%.3f | rec=%s",
+        assessment_id,
         result.processing_time_ms,
         result.confidence_score,
         result.recommendation,
