@@ -180,7 +180,7 @@ class TestHappyPath:
         payload = _build_multipart(property_owned=True)
         resp    = client.post("/v1/assess", files=payload["files"], data=payload["data"])
         ic      = resp.json()["income_calculation"]
-        assert ic["effective_rent"] == 0 or ic["property_owned"] is True
+        assert ic["rent_deducted"] == 0 or ic["property_owned"] is True
 
     def test_5_images_accepted(self, client):
         payload = _build_multipart(n_images=5)

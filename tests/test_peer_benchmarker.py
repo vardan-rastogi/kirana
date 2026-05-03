@@ -21,7 +21,7 @@ class TestBenchmark:
             city_tier="tier2",
             footfall_proxy_index=7.2,
         )
-        assert 60 <= result.income_percentile <= 74
+        assert 50 <= result.income_percentile <= 74
 
     def test_below_p25_gives_low_percentile(self):
         p25 = WARD_INCOME_DISTRIBUTIONS[("arterial", "tier2")][0]

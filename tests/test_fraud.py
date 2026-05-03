@@ -65,14 +65,14 @@ def _run_check(
     sdk_headers=None,
 ) -> FraudResult:
     return FraudChecker().check(
-        vision=vision or _make_vision(),
-        geo=geo or _make_geo(),
-        temporal=temporal or _make_temporal(),
-        image_bytes_list=image_bytes_list or [b"img1", b"img2", b"img3"],
+        vision=vision if vision is not None else _make_vision(),
+        geo=geo if geo is not None else _make_geo(),
+        temporal=temporal if temporal is not None else _make_temporal(),
+        image_bytes_list=image_bytes_list if image_bytes_list is not None else [b"img1", b"img2", b"img3"],
         is_rooted=is_rooted,
         is_mock_location=is_mock_location,
         hmac_valid=hmac_valid,
-        sdk_headers=sdk_headers or ["KIRANAIQ_SDK_MANIFEST_V1"],
+        sdk_headers=sdk_headers if sdk_headers is not None else ["KIRANAIQ_SDK_MANIFEST_V1"],
     )
 
 
