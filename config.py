@@ -21,6 +21,13 @@ import logging
 import os
 from functools import lru_cache
 
+from dotenv import load_dotenv
+
+# Load .env file BEFORE any os.getenv() calls.
+# This injects .env values into the process environment so all subsequent
+# os.getenv() calls in this module (and everywhere else) see them.
+load_dotenv()
+
 logger = logging.getLogger("kiranaiq.config")
 
 # ---------------------------------------------------------------------------
