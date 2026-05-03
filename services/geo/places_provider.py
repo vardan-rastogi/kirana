@@ -25,6 +25,7 @@ import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
+import asyncio
 import httpx
 
 from services.geo.base import GeoProvider, GeoSignals
@@ -163,7 +164,6 @@ class PlacesGeoProvider(GeoProvider):
 
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
             # Fire competitor + transit searches concurrently
-            import asyncio
             competitor_resp, transit_resp, school_resp = await asyncio.gather(
                 self._nearby_search(
                     client, location_str,

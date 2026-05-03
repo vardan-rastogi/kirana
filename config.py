@@ -165,9 +165,15 @@ def get_fusion_provider():
 def get_narrative_provider():
     """Return the active NarrativeProvider based on runtime mode."""
     if MODE == "production" and OPENAI_API_KEY:
-        logger.info("Narrative provider: GPT4oNarrativeProvider (gpt-4o)")
-        from services.narrative.gpt4o_provider import GPT4oNarrativeProvider
-        return GPT4oNarrativeProvider(api_key=OPENAI_API_KEY)
+        try:
+            logger.info("Narrative provider: GPT4oNarrativeProvider (gpt-4o)")
+            from services.narrative.gpt4o_provider import GPT4oNarrativeProvider
+            return GPT4oNarrativeProvider(api_key=OPENAI_API_KEY)
+        except ImportError:
+            logger.warning(
+                "GPT4oNarrativeProvider unavailable (missing file or dependency). "
+                "Falling back to TemplateNarrativeProvider."
+            )
     logger.info("Narrative provider: TemplateNarrativeProvider (demo mode)")
     from services.narrative.template_provider import TemplateNarrativeProvider
     return TemplateNarrativeProvider()
